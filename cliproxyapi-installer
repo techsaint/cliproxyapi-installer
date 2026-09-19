@@ -11,6 +11,9 @@ REPO_OWNER="router-for-me"
 REPO_NAME="CLIProxyAPI"
 INSTALL_DIR="$HOME/cliproxyapi"
 API_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest"
+RELEASES_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases"
+# Optional: set GITHUB_TOKEN to raise the GitHub API rate limit (60/hour unauthenticated)
+GITHUB_TOKEN="${GITHUB_TOKEN:-}"
 SCRIPT_NAME="cliproxyapi-installer"
 
 # Colors for output
@@ -23,23 +26,23 @@ NC='\033[0m' # No Color
 
 # Logging functions
 log_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
+    echo -e "${BLUE}[INFO]${NC} $1" >&2
 }
 
 log_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
+    echo -e "${GREEN}[SUCCESS]${NC} $1" >&2
 }
 
 log_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
+    echo -e "${YELLOW}[WARNING]${NC} $1" >&2
 }
 
 log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
+    echo -e "${RED}[ERROR]${NC} $1" >&2
 }
 
 log_step() {
-    echo -e "${CYAN}[STEP]${NC} $1"
+    echo -e "${CYAN}[STEP]${NC} $1" >&2
 }
 
 # Display authentication information for first-time setup
@@ -319,7 +322,7 @@ detect_linux_arch() {
             echo "linux_amd64"
             ;;
         arm64|aarch64)
-            echo "linux_arm64"
+            echo "linux_aarch64"
             ;;
         *)
             log_error "Unsupported architecture: $(uname -m). Only x86_64 and arm64 are supported on Linux."
@@ -349,56 +352,150 @@ check_dependencies() {
     fi
 }
 
-# Fetch latest release info from GitHub API
-fetch_release_info() {
-    log_info "Fetching latest release information..."
-    
-    local release_info
+# HTTP GET helper: prints body on success, returns non-zero on any HTTP/network error
+http_get() {
+    local url="$1"
+    shift
     if command -v curl >/dev/null 2>&1; then
-        release_info=$(curl -s "$API_URL")
+        curl -fsSL "$@" "$url"
     else
-        release_info=$(wget -qO- "$API_URL")
+        wget -qO- "$url"
     fi
-    
-    if [[ -z "$release_info" ]]; then
-        log_error "Failed to fetch release information from GitHub API"
-        exit 1
-    fi
-    
-    echo "$release_info"
 }
 
-# Extract version and download URL from release info
-extract_release_info() {
-    local release_info="$1"
-    local os_arch="$2"
-    
-    local version
-    version=$(echo "$release_info" | grep -o '"tag_name": *"[^"]*"' | cut -d'"' -f4 | sed 's/^v//')
-    
-    if [[ -z "$version" ]]; then
-        log_error "Failed to extract version from release info"
-        exit 1
-    fi
-    
-    local expected_filename="CLIProxyAPI_${version}_${os_arch}"
-    local download_url=""
-    
-    # Handle different file extensions
-    if [[ "$os_arch" == windows_* ]]; then
-        expected_filename="${expected_filename}.zip"
+# Resolve the latest release tag without the GitHub API (follows the /releases/latest redirect)
+fetch_latest_tag_from_web() {
+    local location=""
+    if command -v curl >/dev/null 2>&1; then
+        location=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "${RELEASES_URL}/latest" 2>/dev/null || true)
     else
-        expected_filename="${expected_filename}.tar.gz"
+        location=$(wget --spider -S "${RELEASES_URL}/latest" 2>&1 | grep -i '^ *Location:' | tail -1 | awk '{print $2}' | tr -d '\r' || true)
     fi
-    
-    download_url=$(echo "$release_info" | grep -o "\"browser_download_url\": *\"[^\"]*${expected_filename}[^\"]*\"" | cut -d'"' -f4)
-    
-    if [[ -z "$download_url" ]]; then
-        log_error "Failed to find download URL for ${expected_filename}"
+    [[ "$location" == */releases/tag/* ]] || return 1
+    echo "${location##*/releases/tag/}"
+}
+
+# Fetch latest release info. Prints "version|download_url" for the given platform.
+# Primary: GitHub REST API. Fallback: scrape the release page (works when the API is rate limited).
+fetch_release_info() {
+    local os_arch="$1"
+    local expected_filename version download_url
+
+    log_info "Fetching latest release information..."
+
+    # --- Primary: GitHub API ---------------------------------------------------
+    # Unauthenticated API calls are limited to 60/hour per IP. Use GITHUB_TOKEN if set,
+    # otherwise borrow the gh CLI's token when gh is installed and logged in (5000/hour).
+    local token="$GITHUB_TOKEN"
+    if [[ -z "$token" ]] && command -v gh >/dev/null 2>&1; then
+        token=$(gh auth token 2>/dev/null || true)
+    fi
+
+    # The auth header is passed through a config read from stdin / a private temp file,
+    # so the token never appears on a command line (visible in `ps`).
+    # Fetched without curl -f so an error body can be inspected below.
+    local release_info=""
+    if command -v curl >/dev/null 2>&1; then
+        if [[ -n "$token" ]]; then
+            log_info "Using authenticated GitHub API request"
+            release_info=$(printf 'header = "Authorization: Bearer %s"\n' "$token" \
+                | curl -sSL -K - "$API_URL" 2>/dev/null || true)
+        else
+            release_info=$(curl -sSL "$API_URL" 2>/dev/null || true)
+        fi
+    else
+        if [[ -n "$token" ]]; then
+            log_info "Using authenticated GitHub API request"
+            local wgetrc
+            wgetrc=$(mktemp)
+            chmod 600 "$wgetrc"
+            printf 'header = Authorization: Bearer %s\n' "$token" > "$wgetrc"
+            release_info=$(WGETRC="$wgetrc" wget -qO- "$API_URL" 2>/dev/null || true)
+            rm -f "$wgetrc"
+        else
+            release_info=$(wget -qO- "$API_URL" 2>/dev/null || true)
+        fi
+    fi
+
+    # A usable response has a tag_name; anything else (rate limit, bad token, 404,
+    # outage) drops through to the fallback below.
+    version=""
+    if [[ -n "$release_info" ]]; then
+        version=$(printf '%s\n' "$release_info" \
+            | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4 | sed 's/^v//' || true)
+    fi
+
+    if [[ -n "$version" ]]; then
+        expected_filename=$(release_asset_name "$version" "$os_arch")
+        download_url=$(printf '%s\n' "$release_info" \
+            | grep -o "\"browser_download_url\": *\"[^\"]*/${expected_filename}\"" \
+            | head -1 | cut -d'"' -f4 || true)
+        if [[ -n "$download_url" ]]; then
+            echo "${version}|${download_url}"
+            return 0
+        fi
+        log_error "Latest release v${version} has no asset named ${expected_filename}"
+        log_info "Available assets:"
+        printf '%s\n' "$release_info" | grep -o '"name": *"CLIProxyAPI_[^"]*"' | cut -d'"' -f4 | sed 's/^/  /' >&2 || true
         exit 1
     fi
-    
+
+    # --- Fallback: release web page --------------------------------------------
+    local api_message=""
+    if [[ -n "$release_info" ]]; then
+        api_message=$(printf '%s\n' "$release_info" \
+            | grep -o '"message": *"[^"]*"' | head -1 | cut -d'"' -f4 || true)
+    fi
+    if [[ -n "$api_message" ]]; then
+        log_warning "GitHub API: ${api_message}"
+    else
+        log_warning "GitHub API request failed or returned no usable data"
+    fi
+    log_info "Falling back to the GitHub release page"
+    case "$api_message" in
+        *"rate limit"*)
+            log_info "Tip: log in with 'gh auth login' or export GITHUB_TOKEN to raise the API limit"
+            ;;
+    esac
+
+    local tag
+    tag=$(fetch_latest_tag_from_web) || {
+        log_error "Could not determine the latest release from ${RELEASES_URL}/latest"
+        log_info "Check your network connection, or try again later"
+        exit 1
+    }
+    version="${tag#v}"
+    expected_filename=$(release_asset_name "$version" "$os_arch")
+
+    # Confirm the asset exists (HEAD request) rather than trusting the naming convention blindly
+    download_url="${RELEASES_URL}/download/${tag}/${expected_filename}"
+    local exists=false
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSLI -o /dev/null "$download_url" 2>/dev/null && exists=true
+    else
+        wget --spider -q "$download_url" 2>/dev/null && exists=true
+    fi
+
+    if [[ "$exists" != true ]]; then
+        log_error "Latest release ${tag} has no asset named ${expected_filename}"
+        log_info "Available assets:"
+        http_get "${RELEASES_URL}/expanded_assets/${tag}" 2>/dev/null \
+            | grep -o "releases/download/${tag}/[^\"]*" | sed "s#.*/##; s/^/  /" >&2 || true
+        exit 1
+    fi
+
     echo "${version}|${download_url}"
+}
+
+# Build the expected release asset filename for a version and platform
+release_asset_name() {
+    local version="$1"
+    local os_arch="$2"
+    if [[ "$os_arch" == windows_* ]]; then
+        echo "CLIProxyAPI_${version}_${os_arch}.zip"
+    else
+        echo "CLIProxyAPI_${version}_${os_arch}.tar.gz"
+    fi
 }
 
 # Check if CLIProxyAPI is already installed
@@ -462,18 +559,40 @@ is_service_running() {
     systemctl --user is-active --quiet cliproxyapi.service 2>/dev/null
 }
 
-# Check if any CLIProxyAPI processes are running
-is_cliproxyapi_running() {
-    pgrep -f "cli-proxy-api" >/dev/null 2>&1
+
+# Real (symlink-resolved) path of the installation directory
+install_dir_realpath() {
+    readlink -f "$INSTALL_DIR" 2>/dev/null || echo "$INSTALL_DIR"
 }
 
-# Stop any running CLIProxyAPI processes
+# List PIDs of CLIProxyAPI processes that belong to THIS installation.
+# Only processes owned by the current user whose executable lives inside
+# $INSTALL_DIR are matched. Unrelated processes that merely mention
+# "cli-proxy-api" on their command line (editors, greps, other installs) are ignored.
+find_cliproxyapi_pids() {
+    local real_dir pid exe
+    real_dir=$(install_dir_realpath)
+    for pid in $(pgrep -u "$(id -u)" -x "cli-proxy-api" 2>/dev/null || true); do
+        [[ "$pid" == "$$" ]] && continue
+        exe=$(readlink "/proc/${pid}/exe" 2>/dev/null || true)
+        exe="${exe% (deleted)}"
+        if [[ -n "$exe" && "$exe" == "${real_dir}/"* ]]; then
+            echo "$pid"
+        fi
+    done
+    return 0
+}
+
+is_cliproxyapi_running() {
+    [[ -n "$(find_cliproxyapi_pids)" ]]
+}
+
 stop_cliproxyapi_processes() {
     local pids
-    pids=$(pgrep -f "cli-proxy-api" 2>/dev/null || true)
+    pids=$(find_cliproxyapi_pids)
     
     if [[ -n "$pids" ]]; then
-        log_info "Stopping running CLIProxyAPI processes..."
+        log_info "Stopping CLIProxyAPI processes running from ${INSTALL_DIR}..."
         echo "$pids" | while read -r pid; do
             if [[ -n "$pid" ]]; then
                 kill "$pid" 2>/dev/null || true
@@ -486,7 +605,7 @@ stop_cliproxyapi_processes() {
         
         # Check if any processes are still running and force kill if needed
         local remaining_pids
-        remaining_pids=$(pgrep -f "cli-proxy-api" 2>/dev/null || true)
+        remaining_pids=$(find_cliproxyapi_pids)
         if [[ -n "$remaining_pids" ]]; then
             log_warning "Some processes didn't stop gracefully, force killing..."
             echo "$remaining_pids" | while read -r pid; do
@@ -498,13 +617,12 @@ stop_cliproxyapi_processes() {
             sleep 1
         fi
         
-        log_success "All CLIProxyAPI processes stopped"
+        log_success "All CLIProxyAPI processes from ${INSTALL_DIR} stopped"
     else
-        log_info "No CLIProxyAPI processes are running"
+        log_info "No CLIProxyAPI processes from ${INSTALL_DIR} are running"
     fi
 }
 
-# Stop systemd service if running
 stop_service() {
     if is_service_running; then
         log_info "Stopping CLIProxyAPI service..."
@@ -656,14 +774,15 @@ download_file() {
     
     log_info "Downloading $(basename "$url")..."
     
+    local ok=true
     if command -v curl >/dev/null 2>&1; then
-        curl -L -o "$output" "$url"
+        curl -fL -o "$output" "$url" || ok=false
     else
-        wget -O "$output" "$url"
+        wget -O "$output" "$url" || ok=false
     fi
     
-    if [[ ! -f "$output" ]]; then
-        log_error "Failed to download file"
+    if [[ "$ok" != true || ! -s "$output" ]]; then
+        log_error "Failed to download $url"
         exit 1
     fi
     
@@ -756,15 +875,12 @@ install_cliproxyapi() {
     os_arch=$(detect_linux_arch)
     log_step "Detected platform: $os_arch"
     
-    # Fetch release info
-    local release_info
-    release_info=$(fetch_release_info)
-    
-    # Extract version and download URL
+    # Fetch release info (version and download URL for this platform)
     local release_data
-    release_data=$(extract_release_info "$release_info" "$os_arch")
-    local version=$(echo "$release_data" | cut -d'|' -f1)
-    local download_url=$(echo "$release_data" | cut -d'|' -f2)
+    release_data=$(fetch_release_info "$os_arch")
+    local version download_url
+    version="${release_data%%|*}"
+    download_url="${release_data#*|}"
     
     log_step "Latest version: $version"
     

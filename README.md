@@ -149,6 +149,7 @@ Add `--no-browser` to any login command to print the URL instead of opening a br
 
 - **Operating System**: Linux (amd64, arm64)
 - **Required Tools**: `curl` or `wget`, `tar`
+- **Optional**: `gh` (GitHub CLI) logged in, or a `GITHUB_TOKEN` environment variable, to avoid GitHub API rate limits
 - **Shell**: Bash
 
 ### Installing Dependencies
@@ -296,19 +297,36 @@ ls -la ~/.config/systemd/user/cliproxyapi.service
     ./cliproxyapi-installer check-config
     ```
 
-5. **Port Already in Use**
+5. **Installer stops after "Detected platform" / GitHub API rate limit**
+
+    Unauthenticated GitHub API requests are limited to 60 per hour **per IP address**, no matter which repository is queried or whether you have a paid GitHub plan. When the limit is hit the installer now falls back to reading the release page directly, so it keeps working. To use the API with the much higher authenticated limit, do one of:
+    ```bash
+    # Option A: log in with the GitHub CLI once; the installer picks up its token automatically
+    gh auth login
+
+    # Option B: provide a personal access token for this run
+    GITHUB_TOKEN=ghp_xxx ./cliproxyapi-installer
+    # (when piping from curl, the variable must be set on the bash side)
+    curl -fsSL <installer-url> | GITHUB_TOKEN=ghp_xxx bash
+    ```
+    Check your current limit with:
+    ```bash
+    curl -s https://api.github.com/rate_limit
+    ```
+
+6. **Port Already in Use**
     ```bash
     # Check what's using port 8317
     netstat -tlnp | grep 8317
     
     # Stop the existing process
-    pkill cli-proxy-api
+    pkill -u "$USER" -x cli-proxy-api   # exact process name, current user only
     
     # Then restart the service
     systemctl --user restart cliproxyapi.service
     ```
 
-6. **Systemd Service Issues**
+7. **Systemd Service Issues**
     ```bash
     # Reload systemd daemon
     systemctl --user daemon-reload
@@ -322,7 +340,7 @@ ls -la ~/.config/systemd/user/cliproxyapi.service
     systemctl --user start cliproxyapi.service
     ```
 
-7. **Upgrade Service Issues**
+8. **Upgrade Service Issues**
     ```bash
     # If service doesn't restart after upgrade
     systemctl --user status cliproxyapi.service
@@ -334,7 +352,7 @@ ls -la ~/.config/systemd/user/cliproxyapi.service
     systemctl --user restart cliproxyapi.service
     ```
 
-8. **Configuration Protection Issues**
+9. **Configuration Protection Issues**
     ```bash
     # If your config was accidentally overwritten (should never happen)
     # Check backup directory
@@ -421,6 +439,15 @@ This installer script is released under the same license as CLIProxyAPI.
 ## Changelog
 
 ### Recent Improvements
+
+#### ✅ **Resilient Release Lookup**
+- Falls back to the GitHub release page whenever the GitHub API request fails (rate limit, bad or expired token, outage)
+- Uses the `gh` CLI token or `GITHUB_TOKEN` automatically for authenticated API requests
+- Clear error listing the available assets if no build matches your platform
+- Fixed arm64 downloads (upstream assets are named `linux_aarch64`)
+- Downloads now fail loudly on HTTP errors instead of extracting an error page
+- Process cleanup during upgrades only targets binaries inside the install directory, never other `cli-proxy-api` processes on the machine
+
 
 #### ✅ **Smart Service Management**
 - **Automatic Service Detection**: Installer detects if CLIProxyAPI service is running before upgrades
